@@ -10,8 +10,6 @@ e3_only/artifacts/
 e3_only/runs/
 e3_only/e3_only/
 
-# ── Dataset (upload separately or download) ──
-dlrsd/
 
 # ── Python ──
 __pycache__/
