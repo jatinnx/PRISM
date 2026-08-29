@@ -37,7 +37,7 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from PRISM.e3_only.data.class_map import CLASS_NAMES, PALETTE  # noqa: E402
+from e3_only.data.class_map import CLASS_NAMES, PALETTE  # noqa: E402
 
 NC = len(CLASS_NAMES)
 

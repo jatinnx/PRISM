@@ -36,11 +36,11 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from PRISM.e3_only.configs.base import Config, resolve                 # noqa: E402
-from PRISM.e3_only.core.regions import propagate_points_np             # noqa: E402
-from PRISM.e3_only.data.class_map import CLASS_NAMES, NUM_CLASSES      # noqa: E402
+from e3_only.configs.base import Config, resolve                 # noqa: E402
+from e3_only.core.regions import propagate_points_np             # noqa: E402
+from e3_only.data.class_map import CLASS_NAMES, NUM_CLASSES      # noqa: E402
 
-DENSE_TRAIN_MASKS = Path("/home/cse-sdpl/Downloads/point_only_semseg/dlrsd/train_1cmasks")
+DENSE_TRAIN_MASKS = Path("dlrsd/train_1cmasks")
 
 
 def voronoi_labels(points, shape):

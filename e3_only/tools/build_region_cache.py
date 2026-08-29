@@ -55,7 +55,7 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from PRISM.e3_only.configs.base import Config, resolve  # noqa: E402
+from e3_only.configs.base import Config, resolve  # noqa: E402
 
 _SAM_INPUT = 1024
 

@@ -42,14 +42,14 @@ class Config:
     num_workers: int = 2
 
     # --- data ---
-    train_manifest: str = "/home/cse-sdpl/Downloads/point_only_semseg/point_only_sam_rs_Es_5pt/data/train.json"      # points only, NO mask key
-    val_manifest: str = "/home/cse-sdpl/Downloads/point_only_semseg/point_only_sam_rs_Es_5pt/data/val.json"          # masks present (remapped 0..16 at write time)
+    train_manifest: str = "data/train.json"      # points only, NO mask key
+    val_manifest: str = "data/val.json"          # masks present (remapped 0..16 at write time)
     image_size: int = 256
     num_classes: int = 17                        # DLRSD classes 0..16 after remap
     background_class: int | None = None          # DLRSD has no background class
 
     # --- model ---
-    sam_checkpoint: str = "/home/cse-sdpl/Downloads/point_only_semseg/sam_vit_b_01ec64.pth"
+    sam_checkpoint: str = "../sam_vit_b_01ec64.pth"
     lora_rank: int = 8
     lora_alpha: float = 16.0
     lora_dropout: float = 0.0

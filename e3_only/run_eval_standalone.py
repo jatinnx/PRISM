@@ -3,8 +3,8 @@
 import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
 
-from PRISM.e3_only.configs.base import Config, resolve
-from PRISM.e3_only.evaluate import evaluate
+from e3_only.configs.base import Config, resolve
+from e3_only.evaluate import evaluate
 
 def run_eval(checkpoint, save_preds, log_path):
     cfg = Config()

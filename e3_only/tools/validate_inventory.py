@@ -27,14 +27,14 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from PRISM.e3_only.configs.base import resolve                      # noqa: E402
-from PRISM.e3_only.data.class_map import CLASS_NAMES, NUM_CLASSES    # noqa: E402
+from e3_only.configs.base import resolve                      # noqa: E402
+from e3_only.data.class_map import CLASS_NAMES, NUM_CLASSES    # noqa: E402
 
-DLRSD = Path("/home/cse-sdpl/Downloads/point_only_semseg/dlrsd")
+DLRSD = Path("dlrsd")
 DENSE_TRAIN_MASKS = DLRSD / "train_1cmasks"
 
 
-def main(manifest="/home/cse-sdpl/Downloads/point_only_semseg/point_only_sam_rs_Es_5pt/data/train.json"):
+def main(manifest="data/train.json"):
     items = json.loads(Path(resolve(manifest)).read_text())
     print(f"manifest: {manifest}\nimages: {len(items)}")
 
