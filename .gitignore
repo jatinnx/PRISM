@@ -1,0 +1,46 @@
+# ── Model checkpoints (download separately) ──
+sam_vit_b_01ec64.pth
+*.pth
+*.pt
+
+# ── Region caches (regenerate with build_region_cache) ──
+e3_only/artifacts/
+
+# ── Training runs / outputs ──
+e3_only/runs/
+e3_only/e3_only/
+
+# ── Dataset (upload separately or download) ──
+dlrsd/
+
+# ── Python ──
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# ── Virtual environments ──
+.venv/
+venv/
+env/
+
+# ── IDE ──
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS ──
+.DS_Store
+Thumbs.db
+
+# ── Logs ──
+*.log
+
+# ── Jupyter ──
+.ipynb_checkpoints/
