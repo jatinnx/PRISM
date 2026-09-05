@@ -2,6 +2,7 @@
 
     L = L_point + w_prop L_prop                      (human labels: ~15 clicks, then their regions)
       + w_abs  L_abs  + w_pres L_pres + w_area L_area (the point inventory, as a dense set constraint)
+      + w_phead L_phead                              (the point inventory, as a prediction target)
       + w_hom  L_hom  + w_bnd  L_bnd  + w_potts L_potts (geometry: frozen partition + image evidence)
       + w_sh   L_sh   + w_shead L_shead              (illumination: physical shadow model)
       + w_self L_self                                (self-training, projected onto all of the above)
@@ -21,7 +22,7 @@ the 17 classes losing ground. Training longer made it worse.
 So the terms are grouped by *where their information comes from*, and the group
 that comes from the network is both the smallest and the last to switch on:
 
-  human-derived   L_point L_prop L_abs L_pres L_area   annotations only
+  human-derived   L_point L_prop L_abs L_pres L_area L_phead   annotations only
   image-derived   L_potts L_bnd L_sh L_shead           image formation only
   frozen-geometry L_hom L_bnd                          partition fixed before step 1
   model-derived   L_self                               and only through the filter of the rest
@@ -95,7 +96,7 @@ def margin_point_loss(cos: torch.Tensor, scale: torch.Tensor,
 
 
 def smoothed_region_ce(logits: torch.Tensor, labels: torch.Tensor,
-                       present: torch.Tensor, eps: float = 0.10,
+                       present: torch.Tensor, eps=0.10,
                        class_weight: Optional[torch.Tensor] = None,
                        ignore: Optional[torch.Tensor] = None) -> torch.Tensor:
     """Cross-entropy on propagated labels, smoothed *inside the inventory*.
@@ -106,9 +107,24 @@ def smoothed_region_ce(logits: torch.Tensor, labels: torch.Tensor,
     spread the residual mass over all 17 classes including ones the image does not
     contain, undoing L_abs; here it is spread only over S, so the two terms agree.
 
-    Minimiser: p_y = 1 - eps + eps/|S| at every propagated pixel, i.e. confident
-    but not saturated -- which is the correct target for a label known to be right
-    about (1 - eps) of the time.
+    ``eps`` may be a scalar or a (C,) tensor indexed by the propagated label. The
+    per-class form exists because the noise is not uniform across classes: dock
+    and ship propagate through thin waterfront regions that straddle each other,
+    while field and sea occupy regions a SAM mask captures whole. Measured, the
+    spread is an order of magnitude (tools/validate_regions.py: per-class
+    1 - purity from 0.000 to 0.507). Using the mean for every class asks the
+    network to distrust its most reliable labels and trust its least.
+
+    Where the 17 numbers come from matters for the point-only claim: NOT from
+    validate_regions, which reads dense masks. tools/measure_prop_trust.py
+    estimates each class's relative risk from how often its point regions also
+    contain a foreign point -- annotations only -- and only the global scale comes
+    from the already-declared measured scalar. Rank agreement with the dense-mask
+    truth is Spearman +0.801 over the 17 classes.
+
+    Minimiser: p_y = 1 - eps_y + eps_y/|S| at every propagated pixel, i.e.
+    confident but not saturated -- which is the correct target for a label known to
+    be right about (1 - eps_y) of the time.
     """
     b, c, h, w = logits.shape
     valid = labels >= 0
@@ -121,7 +137,11 @@ def smoothed_region_ce(logits: torch.Tensor, labels: torch.Tensor,
     pm = present[:, :, None, None].to(logp.dtype)
     n_present = pm.sum(1, keepdim=True).clamp_min(1.0)
     hard = F.one_hot(labels.clamp_min(0), c).permute(0, 3, 1, 2).to(logp.dtype)
-    target = (1.0 - eps) * hard + eps * pm / n_present
+    if torch.is_tensor(eps) and eps.ndim == 1:
+        e = eps.to(logp.device, logp.dtype)[labels.clamp_min(0)][:, None]  # (B,1,H,W)
+    else:
+        e = float(eps)
+    target = (1.0 - e) * hard + e * pm / n_present
     ce = -(target * logp).sum(1)
 
     if class_weight is not None:
@@ -157,18 +177,19 @@ def hard_ce(logits: torch.Tensor, labels: torch.Tensor,
 @dataclass
 class ObjectiveWeights:
     point: float = 1.0
-    prop: float = 0.60
+    prop: float = 0.60        # strong prop supervision for sparse 5-point labels
     absent: float = 0.50
     present: float = 0.20
     area: float = 0.30
-    hom: float = 0.40
-    potts: float = 0.20
+    hom: float = 0.40        # region consistency prevents fragmentation
+    potts: float = 0.20      # pairwise smoothness reduces speckle
     bnd: float = 0.15
     shadow: float = 0.40
     shead: float = 0.20
-    self_train: float = 0.60
-    anchor: float = 0.10
-    repel: float = 0.05
+    self_train: float = 0.60        # V2 proven default
+    pres_head: float = 0.30   # image-level presence BCE against the exact inventory
+    anchor: float = 0.10     # prototypes track encoder fine at default
+    repel: float = 0.05      # light repel; heavy repel hurts classification
     rim: float = 0.0          # restricted information maximisation (ablation row)
 
     # when each term switches on, in epochs
@@ -199,7 +220,9 @@ class PrismObjective:
                  gate: Optional[reg.AdaptiveRegionGate] = None,
                  classifier=None, shead_neg: float = 0.30,
                  self_min_margin: float = 0.10, js_homogeneity: bool = False,
-                 soft_self: bool = False, pres_const_k: bool = False):
+                 soft_self: bool = False, pres_const_k: bool = False,
+                 prop_eps_per_class: Optional[torch.Tensor] = None,
+                 pres_head_pos_weight: float = 4.1146):
         self.w = w
         self.C = num_classes
         self.classifier = classifier
@@ -211,6 +234,8 @@ class PrismObjective:
         self.class_weight = class_weight
         self.leak = leak
         self.prop_eps = prop_eps
+        self.prop_eps_per_class = prop_eps_per_class
+        self.pres_head_pos_weight = pres_head_pos_weight
         self.margin = margin
         self.potts_sigma = potts_sigma
         self.hom_temperature = hom_temperature
@@ -271,7 +296,9 @@ class PrismObjective:
         # -- human-derived ------------------------------------------------
         add("point", margin_point_loss(cos, scale, points, self.class_weight, self.margin),
             self.w.point)
-        add("prop", smoothed_region_ce(logits, prop, present, self.prop_eps,
+        eps_prop = self.prop_eps if self.prop_eps_per_class is None \
+            else self.prop_eps_per_class
+        add("prop", smoothed_region_ce(logits, prop, present, eps_prop,
                                        self.class_weight, ignore=conflict),
             self.w.prop)
         add("absent", inv.absent_class_loss(logits, present, self.leak), self.w.absent)
@@ -286,6 +313,14 @@ class PrismObjective:
         add("area", inv.area_floor_loss(logits, floors), self.w.area)
         if self.w.rim:
             add("rim", inv.restricted_information_loss(logits, present), self.w.rim)
+        # the inventory as a prediction target, not only as a constraint: this is the
+        # one inventory term that survives to inference, where there are no points
+        if self.w.pres_head and "presence_logit" in student:
+            add("phead", inv.presence_head_loss(student["presence_logit"], present,
+                                                self.pres_head_pos_weight),
+                self.w.pres_head)
+        else:
+            log["phead"] = 0.0
 
         # -- illumination -------------------------------------------------
         g_sh = _gate(epoch, self.w.e_shadow, self.w.ramp)
@@ -348,7 +383,7 @@ class PrismObjective:
         clf = self.classifier if self.classifier is not None else student.get("classifier")
         if clf is not None:
             add("anchor", clf.anchor_loss(), self.w.anchor)
-            add("repel", clf.repulsion_loss(), self.w.repel)
+            add("repel", clf.repulsion_loss(margin=0.10), self.w.repel)
         else:
             log["anchor"] = 0.0
             log["repel"] = 0.0

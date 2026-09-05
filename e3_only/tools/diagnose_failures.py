@@ -98,7 +98,7 @@ def shadow_proxy(bgr: np.ndarray) -> np.ndarray:
     return (ratio < 0.80) & dark
 
 
-def analyse(pred_dir: Path, limit=None):
+def analyse(pred_dir: Path, limit=None, confusion_csv=None):
     ids = sorted(p.stem for p in pred_dir.glob("*_gt.png"))
     ids = [i[:-3] for i in ids]                       # strip the "_gt"
     if limit:
@@ -276,10 +276,40 @@ def analyse(pred_dir: Path, limit=None):
         print(f"      {CLASS_NAMES[c]:<12s} rec={rec:.3f} prec={prec:.3f} "
               f"gt_px={conf[c].sum():>9d} pred_px={conf[:, c].sum():>9d}")
 
+    # The top-12 list above ranks pairs by ABSOLUTE pixel mass, so a small class
+    # cannot appear in it however badly it is confused. The row-normalised matrix
+    # is the one to quote per class, and it is written out rather than printed
+    # because 17x17 does not read in a terminal.
+    if confusion_csv:
+        rows = conf.sum(1, keepdims=True)
+        norm = conf / np.maximum(rows, 1)
+        out = Path(confusion_csv)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with out.open("w") as fh:
+            fh.write("true_class,gt_px," + ",".join(CLASS_NAMES) + "\n")
+            for c in range(NC):
+                fh.write(f"{CLASS_NAMES[c]},{int(conf[c].sum())},"
+                         + ",".join(f"{v:.4f}" for v in norm[c]) + "\n")
+        print(f"\n    row-normalised confusion written to {out}")
+        print("    dominant off-diagonal per class (share of that class's true pixels):")
+        for c in range(NC):
+            order = np.argsort(-norm[c])
+            worst = [i for i in order if i != c][:2]
+            got = "  ".join(f"{CLASS_NAMES[i]} {norm[c][i]:.3f}" for i in worst)
+            print(f"      {CLASS_NAMES[c]:<12s} rec={norm[c][c]:.3f}   -> {got}")
+
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("pred_dir")
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--confusion-csv", default=None,
+                    help="also write the ROW-NORMALISED confusion matrix (row = true "
+                         "class, so entry [a][b] is the share of true a predicted b) "
+                         "to this path. Section [6] prints only the top 12 pairs by "
+                         "ABSOLUTE mass, which silently hides every confusion of a "
+                         "small class -- 'field' is 183k px of 86M, so its dominant "
+                         "error cannot appear there no matter how bad it is. Any "
+                         "per-class confusion quoted in METHOD.md comes from this CSV.")
     a = ap.parse_args()
-    analyse(Path(a.pred_dir), a.limit)
+    analyse(Path(a.pred_dir), a.limit, a.confusion_csv)

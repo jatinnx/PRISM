@@ -18,8 +18,8 @@ eval log is itself the evidence rather than something to be inspected by eye:
   TRIMAP PA    pixel accuracy restricted to a band of width d around GT
                boundaries -> the boundary claim, which whole-image mIoU hides
 
-Two optional inference-time switches, both label-free and both reported as their
-own rows rather than folded into the headline number:
+Inference-time switches, all label-free and each reported as its own row rather
+than folded into the headline number:
 
   --tta          average the posterior over the four flip/mirror variants
   --region-vote  pool the posterior over each frozen SAM region and take the
@@ -27,6 +27,12 @@ own rows rather than folded into the headline number:
                  partition training used; it involves no labels and no learning,
                  and it is the cleanest possible test of the claim that the
                  partition carries the object geometry.
+  --presence-gate   soft per-image inventory prior from the presence head
+                 (see inventory.apply_presence_gate)
+  --logit-adjust    Stage 2 decision-time class-prior term, z_c - tau*log pi_c
+                 (see inventory.apply_logit_adjust). tau>0 = the balanced-prior
+                 rule, tau<0 reverses; priors measured by
+                 tools/measure_class_priors.py
 """
 import argparse
 from pathlib import Path
@@ -39,6 +45,7 @@ from torch.utils.data import DataLoader
 
 from .configs.prism import (ARCH_FIELDS, PrismConfig, config_from_checkpoint,
                             resolve)
+from .core import inventory as inv
 from .core.regions import RegionIndex
 from .data.class_map import CLASS_NAMES
 from .data.dataset_prism import PrismDataset, collate_prism
@@ -85,34 +92,112 @@ def boundary_band(gt: np.ndarray, width: int) -> np.ndarray:
 #  inference                                                                  #
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
-def _posterior(model, image, tta: bool):
-    """-> (B,C,H,W) probabilities."""
-    p = model(image)["logits"].softmax(1)
+def _posterior(model, image, tta: bool, gate: float = 0.0, floor: float = 0.05,
+               logit_adjust: Optional[float] = None,
+               log_prior: Optional[torch.Tensor] = None):
+    """-> (B,C,H,W) probabilities.
+
+    ``gate`` > 0 multiplies the posterior by the presence head's own estimate of
+    the image's class set before the softmax. See inventory.apply_presence_gate:
+    this is the only inventory constraint that can act at test time, because it
+    is the only one that does not need the points.
+
+    ``logit_adjust`` / ``log_prior`` apply the Stage 2 class-prior term
+    z_c <- z_c - tau*log pi_c (inventory.apply_logit_adjust) after the gate and
+    before the softmax; both are per-class log offsets, so they compose. tau=0 or
+    no prior is the identity.
+    """
+    def _one(img, flip=None):
+        out = model(img)
+        z = out["logits"]
+        if gate > 0 and "presence_logit" in out:
+            z = inv.apply_presence_gate(z, out["presence_logit"], gate, floor)
+        if logit_adjust is not None and log_prior is not None and logit_adjust != 0:
+            z = inv.apply_logit_adjust(z, log_prior, logit_adjust)
+        z = z.softmax(1)
+        return z if flip is None else torch.flip(z, dims=flip)
+
+    p = _one(image)
     if not tta:
         return p
     for dims in ([3], [2], [2, 3]):
-        q = model(torch.flip(image, dims=dims))["logits"].softmax(1)
-        p = p + torch.flip(q, dims=dims)
+        p = p + _one(torch.flip(image, dims=dims), flip=dims)
     return p / 4.0
 
 
 @torch.no_grad()
-def _region_vote(prob: torch.Tensor, region: torch.Tensor) -> torch.Tensor:
-    """Region-pooled argmax; pixels with no region keep their own argmax."""
+def _region_vote(prob: torch.Tensor, region: torch.Tensor,
+                 n_sam: Optional[torch.Tensor] = None,
+                 sam_only: bool = True, min_size: int = 24) -> torch.Tensor:
+    """Region-pooled argmax; pixels outside an eligible region keep their own argmax.
+
+    Eligibility is not "has a region". A SAM mask is a class-agnostic object
+    proposal and pooling over it is safe; a filler region is a connected component
+    of whatever SAM did not cover, and pooling over one is only safe if it happens
+    to be homogeneous. Measured on train at >=24px, with the point-conflict
+    exclusion applied as training applies it: SAM masks are 0.971 pure, filler that
+    survives the exclusion is 0.952 -- but at test time there are no points, so the
+    exclusion cannot run, and the 449 filler regions it would have dropped sit at
+    0.686 purity over 14.5M pixels, 417 of them larger than 8000px. Voting those
+    repaints an entire blob with one class.
+
+    So: pool over SAM ids only (``sam_only``), and only when the region is big
+    enough for its mean to be worth more than a pixel's own posterior
+    (``min_size``). Everything else keeps its argmax, which is the un-voted
+    prediction -- the vote can then only ever help.
+    """
     ridx = RegionIndex(region)
     m = ridx.mean(prob)                                  # (total, C)
     lab = m.argmax(1)
     voted = ridx.scatter_back_1d(lab.to(torch.float32)).long()
     own = prob.argmax(1)
-    has_region = ridx.scatter_back_1d(
-        (torch.arange(ridx.total, device=prob.device) != ridx.dump).to(torch.float32)) > 0.5
-    return torch.where(has_region, voted, own)
+
+    rid = torch.arange(ridx.total, device=prob.device)
+    ok = rid != ridx.dump                                # not the "no region" slot
+    if min_size > 1:
+        ok = ok & (ridx.count.view(-1) >= min_size)
+    eligible = ridx.scatter_back_1d(ok.to(torch.float32)) > 0.5
+    if sam_only and n_sam is not None:
+        ns = n_sam.to(region.device).view(-1, *([1] * (region.ndim - 1)))
+        eligible = eligible & (region < ns) & (region >= 0)
+    return torch.where(eligible, voted, own)
+
+
+# --------------------------------------------------------------------------- #
+def _load_class_priors(cfg: PrismConfig, name: str, num_classes: int):
+    """Read one prior (C,) vector from artifacts/class_priors.json.
+
+    Measured by tools/measure_class_priors.py from the click inventories only
+    (no dense mask). Refuse to guess: a missing file or a bad entry would
+    silently feed the decision a wrong prior, and a wrong prior is worse than
+    none because it looks measured.
+    """
+    import json
+    p = Path(resolve(cfg.class_priors_json))
+    if not p.exists():
+        raise FileNotFoundError(
+            f"--logit-adjust needs per-class priors at {p}; measure them with\n"
+            f"  python -m e3_only.tools.measure_class_priors")
+    data = json.loads(p.read_text())
+    if name not in data:
+        raise KeyError(f"{p} holds {sorted(data)}, not '{name}'")
+    v = np.asarray(data[name], dtype=np.float64)
+    if v.shape != (num_classes,):
+        raise ValueError(f"prior '{name}' in {p} is {v.shape}, expected "
+                         f"({num_classes},)")
+    if float(v.min()) <= 0.0:
+        raise ValueError(f"prior '{name}' has a non-positive entry -- log would "
+                         f"be -inf; re-measure with tools/measure_class_priors.py")
+    return v
 
 
 # --------------------------------------------------------------------------- #
 def run_eval(model, cfg: PrismConfig, val_manifest: Optional[str] = None,
              log=None, save_preds: Optional[str] = None, tta: bool = False,
-             region_vote: bool = False, limit: Optional[int] = None):
+             region_vote: bool = False, limit: Optional[int] = None,
+             presence_gate: Optional[float] = None,
+             logit_adjust: Optional[float] = None,
+             logit_prior: Optional[str] = None):
     """Evaluate an already-built model.
 
     Split out from ``evaluate`` so the training loop can score its EMA weights
@@ -121,6 +206,20 @@ def run_eval(model, cfg: PrismConfig, val_manifest: Optional[str] = None,
     device = next(model.parameters()).device
     C = cfg.num_classes
     manifest = resolve(val_manifest or cfg.val_manifest)
+    gate = cfg.presence_gate if presence_gate is None else presence_gate
+    adj = cfg.logit_adjust if logit_adjust is None else logit_adjust
+    prior_name = cfg.logit_prior if logit_prior is None else logit_prior
+    log_prior = None
+    if adj != 0.0:
+        freqs = _load_class_priors(cfg, prior_name, C)
+        log_prior = torch.log(torch.as_tensor(freqs, dtype=torch.float32,
+                                              device=device))
+        lo = float((adj * log_prior).min())
+        hi = float((adj * log_prior).max())
+        _out(f"logit adjust tau={adj:g} prior='{prior_name}' "
+             f"(per-class offset range {lo:.3f}..{hi:.3f} logits)", log)
+        _out("  tau>0 = balanced rule (raises under-represented classes); "
+             "tau<0 penalises them -- which direction wins is the measurement", log)
 
     region_npz = None
     if region_vote:
@@ -157,9 +256,12 @@ def run_eval(model, cfg: PrismConfig, val_manifest: Optional[str] = None,
             break
         n_total += 1
         image = batch["image_weak"].to(device, non_blocking=True)
-        prob = _posterior(model, image, tta)
+        prob = _posterior(model, image, tta, gate, cfg.presence_floor,
+                          adj if adj != 0.0 else None, log_prior)
         if region_vote:
-            pred_t = _region_vote(prob, batch["region"].to(device))
+            pred_t = _region_vote(prob, batch["region"].to(device),
+                                  batch.get("n_sam"), cfg.region_vote_sam_only,
+                                  cfg.region_vote_min_size)
         else:
             pred_t = prob.argmax(1)
         pred = pred_t[0].cpu().numpy().astype(np.uint8)
@@ -243,10 +345,21 @@ def run_eval(model, cfg: PrismConfig, val_manifest: Optional[str] = None,
 
 
 # --------------------------------------------------------------------------- #
-def evaluate(cfg: PrismConfig, checkpoint: str, val_manifest: Optional[str] = None,
-             log=None, save_preds: Optional[str] = None, tta: bool = False,
-             region_vote: bool = False, which: str = "teacher",
-             limit: Optional[int] = None):
+def load_for_eval(cfg: PrismConfig, checkpoint: str, log=None,
+                  which: str = "teacher", tta: bool = False,
+                  region_vote: bool = False,
+                  presence_gate: Optional[float] = None):
+    """Build the architecture the checkpoint describes, load it, and guard it.
+
+    Split out of ``evaluate`` so that every consumer of a checkpoint -- the
+    evaluator, tools/proto_geometry.py, tools/oracle_inventory.py -- passes
+    through the SAME completeness guard. A LoRA-less checkpoint scored 0.1807 and
+    was read as 0.5493 once already; the guard must have exactly one home, and
+    a measurement tool that skipped it would re-open that hole from the side.
+
+    Returns ``(model, cfg)``. The returned cfg is the CHECKPOINT's architecture,
+    which may differ from the caller's in any of ARCH_FIELDS.
+    """
     device = torch.device(cfg.device)
 
     # The checkpoint carries the config it was trained with. Rebuild the
@@ -283,16 +396,62 @@ def evaluate(cfg: PrismConfig, checkpoint: str, val_manifest: Optional[str] = No
     missing, unexpected = model.load_state_dict(state, strict=False)
     if unexpected:
         _out(f"WARNING: {len(unexpected)} unexpected keys, e.g. {unexpected[:3]}", log)
-    lora_missing = [k for k in missing if "lora" in k.lower()]
-    if lora_missing:
-        _out(f"WARNING: {len(lora_missing)} LoRA keys missing from the checkpoint -- "
-             f"the backbone adaptation is NOT loaded.", log)
+
+    # A missing TRAINED tensor means this eval measures a partly-random model.
+    # It used to be a warning; a warning scrolled past and 6596 prediction PNGs
+    # from a crippled model (0.1807 instead of its true 0.5493) were read as if
+    # they were the method's output. Only the presence head may be absent: it
+    # was added after some checkpoints were written and is inert at
+    # presence_gate=0. Everything else is fatal.
+    trainable = {n for n, prm in model.named_parameters() if prm.requires_grad}
+    lost = sorted(k for k in missing if k in trainable)
+    optional = [k for k in lost if k.startswith("decoder.presence.")]
+    fatal = [k for k in lost if k not in optional]
+    if fatal:
+        raise RuntimeError(
+            f"{len(fatal)}/{len(trainable)} trained tensors are missing from "
+            f"{Path(checkpoint).name}, e.g. {fatal[:3]}. This checkpoint cannot "
+            f"restore the model it claims to hold; evaluating it would report a "
+            f"number and write predictions for a partly-random network. "
+            f"Re-train, or evaluate a checkpoint written after the "
+            f"trainable_state() completeness guard was added.")
+    # "inert unless --presence-gate > 0" was printed and never enforced. A
+    # missing presence head is a head of RANDOM weights, so a run with the gate on
+    # multiplies the posterior by a random per-class prior and reports the result
+    # as a measurement of the gate. Every checkpoint written before the head
+    # existed hits this, which is most of them.
+    eff_gate = cfg.presence_gate if presence_gate is None else presence_gate
+    if optional and eff_gate > 0:
+        raise RuntimeError(
+            f"--presence-gate {eff_gate} was requested but the presence head is "
+            f"absent from {Path(checkpoint).name} ({len(optional)} tensors "
+            f"missing, e.g. {optional[:2]}). The head would be RANDOMLY "
+            f"initialised, so the gate would multiply the posterior by a random "
+            f"per-class prior and the score would measure noise. Evaluate the "
+            f"gate only on a checkpoint trained with w_pres_head > 0.")
+    if optional:
+        _out(f"note: presence head absent from the checkpoint ({len(optional)} "
+             f"tensors) -- pre-dates it; gate is refused, not silently inert", log)
+    _out(f"loaded {len(trainable) - len(lost)}/{len(trainable)} trained tensors", log)
     model.eval()
     _out(f"checkpoint {Path(checkpoint).name} epoch {ckpt.get('epoch', '?')} "
-         f"weights='{which}' tta={tta} region_vote={region_vote}", log)
+         f"weights='{which}' tta={tta} region_vote={region_vote} "
+         f"presence_gate={cfg.presence_gate if presence_gate is None else presence_gate}",
+         log)
     _out(model.decoder.classifier.report(), log)
+    return model, cfg
 
-    return run_eval(model, cfg, val_manifest, log, save_preds, tta, region_vote, limit)
+
+def evaluate(cfg: PrismConfig, checkpoint: str, val_manifest: Optional[str] = None,
+             log=None, save_preds: Optional[str] = None, tta: bool = False,
+             region_vote: bool = False, which: str = "teacher",
+             limit: Optional[int] = None, presence_gate: Optional[float] = None,
+             logit_adjust: Optional[float] = None,
+             logit_prior: Optional[str] = None):
+    model, cfg = load_for_eval(cfg, checkpoint, log, which, tta, region_vote,
+                               presence_gate)
+    return run_eval(model, cfg, val_manifest, log, save_preds, tta, region_vote, limit,
+                    presence_gate, logit_adjust, logit_prior)
 
 
 # --------------------------------------------------------------------------- #
@@ -359,6 +518,17 @@ def main():
     ap.add_argument("--which", default="teacher", choices=["teacher", "student"])
     ap.add_argument("--tta", action="store_true")
     ap.add_argument("--region-vote", action="store_true")
+    ap.add_argument("--presence-gate", type=float, default=None,
+                    help="soft inventory prior at inference; 0 disables, ~1.0 is the "
+                         "measured-motivated default (see core/inventory.apply_presence_gate)")
+    ap.add_argument("--logit-adjust", type=float, default=None,
+                    help="Stage 2 class-prior term z_c - tau*log pi_c at the decision "
+                         "(see core/inventory.apply_logit_adjust). tau>0 = balanced "
+                         "rule, tau<0 reverses; needs tools/measure_class_priors.py "
+                         "run once. Default 0 = off.")
+    ap.add_argument("--logit-prior", default=None, choices=["presence", "point_share"],
+                    help="which prior in class_priors.json to adjust by "
+                         "(default: the config's, 'presence')")
     ap.add_argument("--save-preds", default=None)
     ap.add_argument("--log", default=None)
     ap.add_argument("--limit", type=int, default=None)
@@ -375,7 +545,8 @@ def main():
         log = p.open("w")
     try:
         evaluate(cfg, a.checkpoint, a.val_manifest, log, a.save_preds,
-                 a.tta, a.region_vote, a.which, a.limit)
+                 a.tta, a.region_vote, a.which, a.limit, a.presence_gate,
+                 a.logit_adjust, a.logit_prior)
     finally:
         if log is not None:
             log.close()

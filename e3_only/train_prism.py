@@ -88,12 +88,28 @@ class EmaShadow:
 #  helpers                                                                    #
 # --------------------------------------------------------------------------- #
 def trainable_state(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
-    """LoRA + stem + decoder tensors. Everything else is the released SAM."""
-    keep = {}
-    for k, v in model.state_dict().items():
-        if "lora" in k.lower() or k.startswith("stem.") or k.startswith("decoder."):
-            keep[k] = v.detach().cpu()
-    return keep
+    """All trainable parameters (LoRA A/B, stem, decoder). Everything else is
+    the frozen SAM backbone.  Uses ``requires_grad`` on ``named_parameters``
+    rather than a name check because LoRA params are named ``.A`` / ``.B``
+    (no ``lora`` substring).  ``state_dict()`` tensors are detached, so we
+    derive the key set from ``named_parameters()`` first."""
+    trainable = {n for n, p in model.named_parameters() if p.requires_grad}
+    out = {k: v.detach().cpu()
+           for k, v in model.state_dict().items()
+           if k in trainable}
+    # A trainable tensor that state_dict() does not expose would be dropped here
+    # WITHOUT ANY ERROR, and the checkpoint would look fine while restoring a
+    # partly-random model. That is not hypothetical: every checkpoint under
+    # runs/prism-no-shadow holds 38 of 132 tensors -- all 96 LoRA A/B matrices
+    # are missing -- so that run's 0.5493 cannot be reproduced from disk (an
+    # offline eval of it scores 0.1807). Silent is the whole problem, so refuse.
+    lost = sorted(trainable - set(out))
+    if lost:
+        raise RuntimeError(
+            f"{len(lost)}/{len(trainable)} trainable tensors are absent from "
+            f"state_dict() and would be silently dropped, e.g. {lost[:3]}. "
+            f"Refusing to write a checkpoint that cannot restore the model.")
+    return out
 
 
 def class_weights_from_points(manifest: str, num_classes: int,
@@ -130,11 +146,19 @@ def class_weights_from_points(manifest: str, num_classes: int,
 
 
 def param_groups(model: torch.nn.Module, cfg: PrismConfig):
+    """Two LR groups: LoRA params (lower lr_backbone) and everything else.
+
+    LoRA params live inside ``sam.*`` and are named ``.A`` / ``.B`` (no
+    ``lora`` substring), so we identify them by prefix instead."""
     lora, decay, no_decay = [], [], []
     for n, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if "lora" in n.lower():
+        # LoRA A/B live under sam.image_encoder.blocks.*.attn/mlp
+        is_lora = n.startswith("sam.") and any(
+            seg in n for seg in (".A", ".B")
+        )
+        if is_lora:
             lora.append(p)
         elif p.ndim <= 1 or "log_scale" in n or n.endswith("classifier.weight"):
             no_decay.append(p)
@@ -260,9 +284,31 @@ def train(cfg: PrismConfig, resume: Optional[str] = None):
         present=cfg.w_present, area=cfg.w_area, hom=cfg.w_hom, potts=cfg.w_potts,
         bnd=cfg.w_bnd, shadow=cfg.w_shadow, shead=cfg.w_shead,
         self_train=cfg.w_self, anchor=cfg.w_anchor, repel=cfg.w_repel,
-        rim=cfg.w_rim, e_hom=cfg.e_hom, e_shadow=cfg.e_shadow, e_self=cfg.e_self,
+        rim=cfg.w_rim, pres_head=cfg.w_pres_head,
+        e_hom=cfg.e_hom, e_shadow=cfg.e_shadow, e_self=cfg.e_self,
         ramp=cfg.ramp_epochs)
-    gate = AdaptiveRegionGate(kappa=cfg.gate_kappa, floor=cfg.gate_floor)
+    # per-class propagation trust. Loaded, never inferred: if the artifact is
+    # absent the run falls back to the measured scalar and says so, rather than
+    # silently training on a 17-vector nobody measured.
+    eps_c = None
+    if cfg.per_class_prop_eps:
+        tp = Path(resolve(cfg.prop_trust_json))
+        if tp.exists():
+            d = json.loads(tp.read_text())
+            v = d.get("prop_eps_per_class")
+            if v is not None and len(v) == cfg.num_classes:
+                eps_c = torch.tensor(v, dtype=torch.float32, device=device)
+                say(f"per-class prop_eps from {tp.name} "
+                    f"(scale {d.get('prop_eps_scale')}, source {d.get('source')}): "
+                    + ", ".join(f"{n}={e:.3f}" for n, e in zip(CLASS_NAMES, v)))
+        if eps_c is None:
+            say(f"WARNING: per_class_prop_eps=True but {tp} is unusable; "
+                f"falling back to the scalar prop_eps={cfg.prop_eps}. Build it with\n"
+                f"  python -m e3_only.tools.measure_prop_trust --prop-eps {cfg.prop_eps}")
+
+    gate_warmup = cfg.gate_warmup if cfg.gate_warmup > 0 else steps_per_epoch
+    gate = AdaptiveRegionGate(kappa=cfg.gate_kappa, floor=cfg.gate_floor, warmup=gate_warmup)
+    say(f"gate warmup: {gate_warmup} steps ({gate_warmup / steps_per_epoch:.1f} epochs)")
     objective = PrismObjective(
         weights, cfg.num_classes, class_weight=cw, leak=cfg.inventory_leak,
         prop_eps=cfg.prop_eps, margin=cfg.margin, potts_sigma=cfg.potts_sigma,
@@ -270,7 +316,8 @@ def train(cfg: PrismConfig, resume: Optional[str] = None):
         edge_quantile=cfg.edge_quantile, edge_radius=cfg.edge_radius, gate=gate,
         classifier=model.decoder.classifier, self_min_margin=cfg.self_min_margin,
         js_homogeneity=cfg.js_homogeneity, soft_self=cfg.soft_self,
-        pres_const_k=cfg.pres_const_k)
+        pres_const_k=cfg.pres_const_k, prop_eps_per_class=eps_c,
+        pres_head_pos_weight=cfg.pres_head_pos_weight)
 
     start_epoch = 0
     if resume:
@@ -291,7 +338,11 @@ def train(cfg: PrismConfig, resume: Optional[str] = None):
         f"curriculum: hom@{cfg.e_hom} shadow@{cfg.e_shadow} self@{cfg.e_self} "
         f"(ramp {cfg.ramp_epochs})")
     say(f"measured constants: inventory_leak={cfg.inventory_leak} "
-        f"prop_eps={cfg.prop_eps}")
+        f"prop_eps={cfg.prop_eps}"
+        + ("" if eps_c is None else " (spent per class)"))
+    say(f"boundary: w_bnd={cfg.w_bnd} edge_radius={cfg.edge_radius} "
+        f"edge_quantile={cfg.edge_quantile}   "
+        f"presence: w_pres_head={cfg.w_pres_head} pos_weight={cfg.pres_head_pos_weight}")
 
     gstep = start_epoch * steps_per_epoch
     seed_feats: List[torch.Tensor] = []
@@ -326,7 +377,11 @@ def train(cfg: PrismConfig, resume: Optional[str] = None):
                 shadowed, shadow_mask = sh.synth_shadow(
                     image.detach(), cfg.shadow_prob, cfg.shadow_atten_lo,
                     cfg.shadow_atten_hi, cfg.shadow_blue_bias, cfg.shadow_penumbra)
-                with amp_ctx():
+                # Two grad-carrying 1024x1024 encoder passes do not fit in 15.57
+                # GiB (measured: OOM in attn.softmax at the first shadowed step).
+                # Recompute the shadowed pass's blocks in backward instead of
+                # storing them; the main pass above is untouched.
+                with amp_ctx(), model.checkpointed():
                     shadow_out = model(shadowed)
                 shadow_out = f32(shadow_out)
 
@@ -345,7 +400,8 @@ def train(cfg: PrismConfig, resume: Optional[str] = None):
             # the prototype anchor reads only human-clicked pixels
             model.decoder.classifier.update_ema(student["embed"].detach(),
                                                 batch["points"], cfg.proto_patch)
-            if epoch == 0 and cfg.finch_init and step < cfg.finch_init_batches:
+            finch_cap = cfg.finch_init_batches if cfg.finch_init_batches > 0 else steps_per_epoch
+            if epoch == 0 and cfg.finch_init and step < finch_cap:
                 f, l = point_embeddings(student["embed"].detach(), batch["points"],
                                         cfg.proto_patch)
                 if f is not None:
@@ -361,8 +417,8 @@ def train(cfg: PrismConfig, resume: Optional[str] = None):
                 say(f"  e{epoch:03d} s{step + 1:04d}/{steps_per_epoch} "
                     + " ".join(f"{k}={logd[k]:.3f}" for k in
                                ("total", "point", "prop", "absent", "present",
-                                "area", "hom", "potts", "bnd", "shadow", "shead",
-                                "self") if k in logd)
+                                "area", "phead", "hom", "potts", "bnd", "shadow",
+                                "shead", "self") if k in logd)
                     + f" tau={logd.get('tau', 0):.3f}"
                       f" acc={logd.get('accept', 0):.2f}"
                       f" lr={sched.get_last_lr()[1]:.2e}")
@@ -424,6 +480,14 @@ def train(cfg: PrismConfig, resume: Optional[str] = None):
                                 "mIoU": miou},
                                save_dir / f"{cfg.experiment}_best.pt")
                 say(f"  new best mIoU {best['mIoU']:.4f} at epoch {best['epoch']}")
+                # -- save predictions for the best checkpoint ---------------
+                if cfg.save_preds:
+                    best_pred_dir = save_dir / f"{cfg.experiment}_best_predictions"
+                    best_pred_dir.mkdir(parents=True, exist_ok=True)
+                    with ema.swapped(model):
+                        run_eval(model, cfg, log=None,
+                                 save_preds=str(best_pred_dir))
+                    say(f"  saved best predictions to {best_pred_dir}")
             elif miou is not None and miou < best["mIoU"] - 0.02:
                 say(f"  WARNING: mIoU is {best['mIoU'] - miou:.4f} below the "
                     f"epoch-{best['epoch']} best -- this is the degradation "
@@ -443,7 +507,8 @@ def main():
                     help="full | no-inventory | no-region | no-self | soft-self | "
                          "no-shadow | no-invariant-stem | no-boundary | "
                          "single-prototype | no-margin | js-homogeneity | "
-                         "const-k-present | e3-normalisation")
+                         "const-k-present | e3-normalisation | "
+                         "improved | no-shadow-improved")
     ap.add_argument("--epochs", type=int, default=None)
     ap.add_argument("--batch-size", type=int, default=None)
     ap.add_argument("--lr", type=float, default=None)
@@ -454,6 +519,8 @@ def main():
     ap.add_argument("--no-amp", action="store_true")
     ap.add_argument("--save-dir", default=None)
     ap.add_argument("--resume", default=None)
+    ap.add_argument("--no-save-preds", action="store_true",
+                    help="skip saving prediction images for the best mIoU checkpoint")
     a = ap.parse_args()
 
     cfg = ablation(a.ablation)
@@ -469,6 +536,8 @@ def main():
         cfg.prop_eps = a.prop_eps
     if a.no_amp:
         cfg.amp = False
+    if a.no_save_preds:
+        cfg.save_preds = False
     if a.save_dir:
         cfg.save_dir = a.save_dir
     cfg.__post_init__()

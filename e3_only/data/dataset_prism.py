@@ -150,6 +150,21 @@ class PrismDataset(Dataset):
             z = np.load(region_npz, allow_pickle=True)
             self.regions = {str(k): i for i, k in enumerate(z["ids"])}
             self._region_data = z["regions"]
+            # n_sam splits the partition: ids < n_sam are SAM masks, ids >= n_sam are
+            # connected components of whatever SAM left over. Training does not need
+            # the split (the point-conflict exclusion already drops the bad filler),
+            # but inference does -- there are no points at test time, so the
+            # region vote has no other way to tell the two apart.
+            if "n_sam" not in z.files:
+                raise KeyError(
+                    f"region cache {region_npz} has a partition but no 'n_sam' "
+                    f"array, so SAM masks cannot be told apart from filler "
+                    f"components. This is not benign: _region_vote gates on "
+                    f"`region < n_sam`, which is false everywhere at n_sam=0, so "
+                    f"--region-vote would degrade to plain argmax while still "
+                    f"printing region_vote=True. Rebuild with "
+                    f"tools/build_region_cache.py.")
+            self._n_sam = z["n_sam"]
             missing = [it.get("id") for it in self.items
                        if str(it.get("id")) not in self.regions]
             if missing:
@@ -167,6 +182,18 @@ class PrismDataset(Dataset):
         if r.shape != (h, w):
             r = cv2.resize(r, (w, h), interpolation=cv2.INTER_NEAREST)
         return r
+
+    def _n_sam_for(self, item) -> int:
+        """SAM/filler split point for this image's partition.
+
+        0 only when there is no partition at all -- a cache that HAS one is
+        rejected at construction if it lacks n_sam, because n_sam=0 makes
+        ``_region_vote``'s ``region < n_sam`` gate false everywhere and turns
+        --region-vote into plain argmax without saying so.
+        """
+        if self.regions is None:
+            return 0                      # no partition at all: nothing to split
+        return int(self._n_sam[self.regions[str(item.get("id"))]])
 
     def __getitem__(self, idx: int) -> Dict:
         item = self.items[idx]
@@ -193,6 +220,7 @@ class PrismDataset(Dataset):
             "region": torch.from_numpy(region.astype(np.int64)),
             "prop": torch.from_numpy(prop.astype(np.int64)),
             "conflict": torch.from_numpy(conflict),
+            "n_sam": int(self._n_sam_for(item)),
             "image_id": str(item.get("id", idx)),
         }
         if not self.training and item.get("mask"):
@@ -213,6 +241,7 @@ def collate_prism(batch: List[Dict]) -> Dict:
         "prop": torch.stack([x["prop"] for x in batch]),
         "conflict": torch.stack([x["conflict"] for x in batch]),
         "points": [x["points"] for x in batch],
+        "n_sam": torch.tensor([x["n_sam"] for x in batch], dtype=torch.long),
         "image_id": [x["image_id"] for x in batch],
     }
     if "mask" in batch[0]:

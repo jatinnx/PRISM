@@ -246,3 +246,102 @@ def restricted_information_loss(logits: torch.Tensor, present: torch.Tensor,
     bar = p.mean(dim=(2, 3))
     ent_marg = -(bar * bar.clamp_min(1e-6).log()).sum(1).mean()
     return w_pixel * ent_pixel - w_marginal * ent_marg
+
+
+# --------------------------------------------------------------------------- #
+#  image-level presence: the inventory as a prediction target                 #
+# --------------------------------------------------------------------------- #
+def presence_head_loss(pres_logit: torch.Tensor, present: torch.Tensor,
+                       pos_weight: Optional[float] = None) -> torch.Tensor:
+    """Multi-label BCE on the image-level presence head against S(I).
+
+    Every other inventory term uses S(I) to constrain the *dense* head. This one
+    asks a separate branch to predict S(I) outright. The distinction matters at
+    inference: L_abs cannot act on a test image because a test image has no
+    points, so nothing at all stops the dense head painting a class the image
+    does not contain -- and measured on val, 10.52% of pixels are exactly that,
+    with field at 83.4%, mobile home 39.0% and sand 32.9%.
+
+    The target is not a pseudo-label. tools/validate_inventory.py reports that
+    S(I) equals the image's true class set in 630 of 630 training images, so this
+    is exact supervision that costs no dense annotation -- one bit per class per
+    image, already implied by the clicks.
+
+    ``pos_weight`` balances the 17-way problem: only ~3.32 of 17 classes are
+    present in a DLRSD image, so an unweighted BCE is minimised at 82% by
+    predicting "absent" everywhere.
+
+    Minimiser: sigma(z_c) = 1 for every c in S(I) and 0 for every c outside it.
+    """
+    t = present.to(pres_logit.dtype)
+    pw = None
+    if pos_weight is not None and pos_weight > 0:
+        pw = torch.as_tensor(pos_weight, dtype=pres_logit.dtype,
+                             device=pres_logit.device)
+    return F.binary_cross_entropy_with_logits(pres_logit, t, pos_weight=pw)
+
+
+@torch.no_grad()
+def apply_presence_gate(logits: torch.Tensor, pres_logit: torch.Tensor,
+                        strength: float = 1.0, floor: float = 0.05
+                        ) -> torch.Tensor:
+    """Down-weight classes the presence head says are not in the image.
+
+        logits_c <- logits_c + strength * log( sigma(z_c) (1 - floor) + floor )
+
+    Additive in log-space, i.e. multiplicative on the posterior, which is what a
+    prior over the class set should be. Deliberately NOT a hard mask: the head is
+    a prediction, not an annotation, and -inf on a mistake deletes a class from an
+    image that contains it, trading a hallucination for a guaranteed miss. With
+    floor = 0.05 the worst case a wrong "absent" can do is subtract
+    log(0.05) ~ -3.0 from that class's logit, which a confident dense prediction
+    can still overcome.
+
+    Identity when strength = 0, so the gate is one number away from off and the
+    ablation row is the same code path.
+    """
+    if strength <= 0:
+        return logits
+    prior = pres_logit.sigmoid() * (1.0 - floor) + floor
+    return logits + strength * prior.clamp_min(1e-6).log()[:, :, None, None]
+
+
+@torch.no_grad()
+def apply_logit_adjust(logits: torch.Tensor, log_prior: torch.Tensor,
+                       strength: float = 1.0) -> torch.Tensor:
+    """Stage 2 decision-time class-prior adjustment (v8-plan.md).
+
+        logits_c <- logits_c - strength * log_prior_c
+
+    with ``log_prior`` the (C,) tensor of per-class log priors, measured by
+    tools/measure_class_priors.py from the click inventories. Additive in
+    log-space, i.e. multiplicative on the posterior, exactly like the presence
+    gate above -- the two compose because both are per-class log terms and
+    addition commutes.
+
+    Why a prior, and why here. The model carries two per-class logit terms
+    nobody designed: ``rare_class_factor=4.0`` in the loss and the aggregator's
+    LSE collapse bonus (bounded by t*log K = 0.277 per class). Both correlate
+    with class frequency, so the argmax is biased by frequency in both
+    directions -- rare classes sprayed into images that lack them, mid-frequency
+    classes absorbed by a larger spectral neighbour. This replaces both with a
+    single deliberate term derived from the measured prior and applied at the
+    decision, where it cannot fight the loss and is one number away from off.
+
+    ``strength > 0`` is the balanced-prior rule (Menon et al., logit adjustment):
+    raising the classes the training data under-represents relative to mIoU's
+    uniform class weighting, which is the correction for absorption. ``strength
+    < 0`` reverses it (penalise the rare classes, the correction for the spray).
+    Which direction earns its keep is a measurement -- Stage 0e correlates the
+    realised aggregator excess with the per-class ghost counts -- so the sign is
+    a CLI choice rather than an assertion here. ``strength == 0`` is the
+    identity, making the ablation row the same code path.
+
+    mIoU is a mean over classes, so the balanced rule is the principled
+    direction for the reported metric; the ghost side is the job of the per-image
+    inventory restriction (apply_presence_gate / --presence-gate), which knows a
+    class is absent from THIS image while a global prior never can.
+    """
+    if strength == 0.0 or log_prior is None:
+        return logits
+    return logits - strength * log_prior[:, None, None]

@@ -195,21 +195,30 @@ class MultiPrototypeClassifier(nn.Module):
         prototypes are the classifier weights, moving them moves the decision
         boundary. In E3 the analogous term was both inert and, when it did fire,
         only able to nudge a 30% side vote.
+
+        Uses 1 - cos_sim squared to penalise large deviations more strongly:
+        prototypes that drift far from their EMA anchor get a quadratic penalty
+        rather than linear, preventing them from decaying too quickly.
         """
         live = self.ema_count > 0
         if not live.any():
             return self.weight.sum() * 0.0
         w = F.normalize(self.weight, dim=-1)[live]
         t = F.normalize(self.ema, dim=-1)[live]
-        return (1.0 - (w * t).sum(-1)).mean()
+        cos_sim = (w * t).sum(-1)
+        return ((1.0 - cos_sim) ** 2).mean()
 
-    def repulsion_loss(self) -> torch.Tensor:
-        """Keep the K prototypes of a class apart.
+    def repulsion_loss(self, margin: float = 0.10) -> torch.Tensor:
+        """Keep the K prototypes of a class apart with a negative margin.
 
         Without this, gradient descent is free to collapse all K onto one point,
         which silently reduces the mixture back to the unimodal model that failure
         mode 6 is caused by. Penalises only *within-class* similarity; pushing
         different classes apart is the classifier's own job.
+
+        The margin pushes prototypes to have cosine similarity <= -margin,
+        ensuring they occupy distinct regions of the feature space rather than
+        merely avoiding overlap (cos_sim > 0).
         """
         if self.k < 2:
             return self.weight.sum() * 0.0
@@ -217,7 +226,8 @@ class MultiPrototypeClassifier(nn.Module):
         g = torch.einsum("ckd,cjd->ckj", w, w)
         eye = torch.eye(self.k, device=w.device, dtype=torch.bool)[None]
         off = g.masked_select(~eye)
-        return off.clamp_min(0.0).mean()
+        # push similarity below -margin: penalise (cos_sim + margin).clamp_min(0)
+        return (off + margin).clamp_min(0.0).mean()
 
     # ------------------------------------------------------------------ #
     @torch.no_grad()
@@ -269,4 +279,5 @@ class MultiPrototypeClassifier(nn.Module):
         g = torch.einsum("ckd,cjd->ckj", w, w)
         eye = torch.eye(self.k, device=w.device, dtype=torch.bool)[None]
         intra = float(g.masked_select(~eye).mean()) if self.k > 1 else 0.0
-        return f"proto live {live}/{self.num_classes * self.k} intra_cos {intra:+.3f} scale {float(self.scale):.1f}"
+        return (f"proto live {live}/{self.num_classes * self.k} "
+                f"intra_cos {intra:+.3f} scale {float(self.scale.detach()):.1f}")

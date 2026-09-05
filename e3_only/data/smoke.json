@@ -1,9 +1,0 @@
-[
- {
-  "id": "1",
-  "image": "/home/cse-sdpl/Downloads/point_only_semseg/dlrsd/merged_training_dataset/images/1.png",
-  "width": 256,
-  "height": 256,
-  "points": [[209, 42, 7], [205, 58, 7], [134, 133, 7], [126, 138, 7], [232, 169, 7], [2, 5, 15], [3, 10, 15], [26, 35, 15], [20, 54, 15], [37, 70, 15]]
- }
-]

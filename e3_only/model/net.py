@@ -19,11 +19,13 @@ Two things this deliberately drops from E3
   over it ever since. ``sam_normalize=True`` fixes it; the flag exists so the old
   behaviour stays reproducible for the comparison row.
 """
+import contextlib
 from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as _ckpt
 from segment_anything import sam_model_registry
 
 from .decoder_v2 import ProgressiveDecoder
@@ -61,14 +63,60 @@ class PrismNet(nn.Module):
         self.num_classes = num_classes
         self.device = device
         self.sam_normalize = sam_normalize
+        # Set by ``checkpointed()``. Off by default, so a run without the shadow
+        # branch is bit-identical to every run measured before this existed.
+        self.grad_checkpoint = False
 
     # ------------------------------------------------------------------ #
+    @contextlib.contextmanager
+    def checkpointed(self):
+        """Recompute the 12 ViT blocks in backward instead of storing them.
+
+        WHY THIS EXISTS. Images are upsampled 256 -> 1024 before the encoder, so
+        one grad-carrying pass holds 4096 tokens of activation through 12 blocks
+        (~11.8 GiB of the 15.57 GiB card at batch 1). The shadow equivariance
+        term needs a SECOND grad-carrying pass over a shadowed copy of the same
+        image, and two such graphs do not fit: with ``w_shadow > 0`` the run dies
+        at the first shadowed step with ``OutOfMemoryError`` in
+        ``attn.softmax``. THAT -- not a design preference -- is why every run
+        measured so far used ``--ablation no-shadow-improved``, and why the
+        shadow mechanism had never actually been executed.
+
+        Trading recompute for memory makes it fit. Scope it to the shadowed pass
+        so the main pass keeps its speed:
+
+            with model.checkpointed():
+                shadow_out = model(shadowed)
+        """
+        was, self.grad_checkpoint = self.grad_checkpoint, True
+        try:
+            yield
+        finally:
+            self.grad_checkpoint = was
+
+    def _encode_blocks(self, x: torch.Tensor) -> torch.Tensor:
+        """``ImageEncoderViT.forward`` with each block wrapped in a checkpoint.
+
+        Reimplemented rather than wrapped in modules so that no parameter is
+        renamed: a checkpoint written with this on loads into a model with it
+        off, and vice versa.
+        """
+        enc = self.sam.image_encoder
+        x = enc.patch_embed(x)
+        if enc.pos_embed is not None:
+            x = x + enc.pos_embed
+        for blk in enc.blocks:
+            x = _ckpt.checkpoint(blk, x, use_reentrant=False)
+        return enc.neck(x.permute(0, 3, 1, 2))
+
     def encode(self, image: torch.Tensor) -> torch.Tensor:
         """(B,3,H,W) in [0,1] -> (B,256,64,64)."""
         x = F.interpolate(image, size=(_SAM_INPUT, _SAM_INPUT), mode="bilinear",
                           align_corners=False)
         if self.sam_normalize:
             x = (x * 255.0 - self.sam.pixel_mean) / self.sam.pixel_std
+        if self.grad_checkpoint and torch.is_grad_enabled():
+            return self._encode_blocks(x)
         return self.sam.image_encoder(x)
 
     def forward(self, image: torch.Tensor, out_size=None) -> Dict[str, torch.Tensor]:
@@ -96,7 +144,8 @@ class PrismNet(nn.Module):
         tot = sum(p.numel() for p in self.parameters())
         tr = sum(p.numel() for p in self.parameters() if p.requires_grad)
         lora = sum(p.numel() for n, p in self.named_parameters()
-                   if p.requires_grad and "lora" in n.lower())
+                   if p.requires_grad and n.startswith("sam.") and
+                   any(seg in n for seg in (".A", ".B")))
         stem = sum(p.numel() for p in self.stem.parameters())
         dec = sum(p.numel() for p in self.decoder.parameters())
         return (f"params total {tot / 1e6:.1f}M  trainable {tr / 1e6:.2f}M "
